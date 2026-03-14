@@ -1,0 +1,19 @@
+# ChromaDB (local vector store, regenerated from PDF)
+chroma_db/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude internal
+.claude/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
