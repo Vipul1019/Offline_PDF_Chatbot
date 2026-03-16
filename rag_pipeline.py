@@ -8,8 +8,8 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from sentence_transformers import CrossEncoder
 
 import config
 
@@ -33,22 +33,27 @@ Answer:"""
 
 class RAGPipeline:
     def __init__(self):
+        # ── Embedding model (BGE — better retrieval accuracy) ─────────────────
         print("[RAG] Loading embedding model (first run will download it)...")
         self.embeddings = HuggingFaceEmbeddings(
             model_name=config.EMBEDDING_MODEL,
             model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},  # required for BGE
         )
+        print("[RAG] Embedding model ready.")
+
+        # ── Cross-encoder re-ranker ────────────────────────────────────────────
+        print("[RAG] Loading re-ranker model (first run will download it)...")
+        self.reranker = CrossEncoder(config.RERANKER_MODEL)
+        print("[RAG] Re-ranker ready.")
+
         self.vector_store  = None
-        self.retriever     = None
-        self.chain         = None
         self.current_model = config.DEFAULT_MODEL
         self.loaded_pdf    = None
-        print("[RAG] Embedding model ready.")
 
     # ── Ollama helpers ────────────────────────────────────────────────────────
 
     def get_available_models(self) -> list[str]:
-        """Return list of model names installed in Ollama."""
         try:
             resp = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=5)
             if resp.status_code == 200:
@@ -67,9 +72,8 @@ class RAGPipeline:
     # ── Ingestion ─────────────────────────────────────────────────────────────
 
     def ingest_pdf(self, pdf_path: str) -> int:
-        """Load a PDF, chunk it, embed it, persist to ChromaDB. Returns chunk count."""
+        """Load PDF → chunk → embed → store in ChromaDB. Returns chunk count."""
 
-        # Clear previous collection so old data doesn't bleed into new PDF
         if os.path.exists(config.CHROMA_DB_PATH):
             shutil.rmtree(config.CHROMA_DB_PATH)
 
@@ -93,61 +97,61 @@ class RAGPipeline:
         )
 
         self.loaded_pdf = os.path.basename(pdf_path)
-        self._build_chain()
         print(f"[RAG] Ingestion complete. {len(chunks)} chunks stored.")
         return len(chunks)
 
-    # ── Chain builder ─────────────────────────────────────────────────────────
+    # ── Re-ranking ────────────────────────────────────────────────────────────
 
-    def _build_chain(self):
-        self.retriever = self.vector_store.as_retriever(
-            search_type="mmr",
-            search_kwargs={"k": config.TOP_K_RESULTS, "fetch_k": config.TOP_K_RESULTS * 3},
-        )
+    def _rerank(self, question: str, docs: list) -> list:
+        """Score every (question, chunk) pair and return top RERANKER_TOP_K docs."""
+        if not docs:
+            return docs
+        pairs  = [(question, doc.page_content) for doc in docs]
+        scores = self.reranker.predict(pairs)
+        ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+        return [doc for _, doc in ranked[:config.RERANKER_TOP_K]]
 
-        llm = ChatOllama(
-            model=self.current_model,
-            base_url=config.OLLAMA_BASE_URL,
-            temperature=0.2,
-        )
-
-        prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-
-        self.chain = (
-            {
-                "context":  self.retriever | self._format_docs,
-                "question": RunnablePassthrough(),
-            }
-            | prompt
-            | llm
-            | StrOutputParser()
-        )
+    # ── Format docs ───────────────────────────────────────────────────────────
 
     @staticmethod
     def _format_docs(docs) -> str:
         return "\n\n---\n\n".join(
-            f"[Page {doc.metadata.get('page', '?')+1}]\n{doc.page_content}"
+            f"[Page {doc.metadata.get('page', '?') + 1}]\n{doc.page_content}"
             for doc in docs
         )
 
     # ── Query (streaming) ─────────────────────────────────────────────────────
 
     def stream_query(self, question: str):
-        """Yield response tokens one by one for streaming UI."""
-        if not self.chain:
+        """Retrieve → re-rank → stream answer."""
+        if not self.vector_store:
             yield "Please upload and process a PDF first."
             return
-        for token in self.chain.stream(question):
+
+        # Step 1: fetch a large candidate pool
+        fetch_k = config.TOP_K_RESULTS * 3
+        candidates = self.vector_store.similarity_search(question, k=fetch_k)
+
+        # Step 2: re-rank and keep the best ones
+        best_docs = self._rerank(question, candidates)
+        context   = self._format_docs(best_docs)
+
+        # Step 3: stream answer from LLM
+        llm    = ChatOllama(
+            model=self.current_model,
+            base_url=config.OLLAMA_BASE_URL,
+            temperature=0.2,
+        )
+        prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+        chain  = prompt | llm | StrOutputParser()
+
+        for token in chain.stream({"context": context, "question": question}):
             yield token
 
     # ── Model switching ───────────────────────────────────────────────────────
 
     def set_model(self, model_name: str):
-        if model_name == self.current_model:
-            return
         self.current_model = model_name
-        if self.vector_store:
-            self._build_chain()
 
     # ── Reset ─────────────────────────────────────────────────────────────────
 
@@ -155,7 +159,5 @@ class RAGPipeline:
         if os.path.exists(config.CHROMA_DB_PATH):
             shutil.rmtree(config.CHROMA_DB_PATH)
         self.vector_store = None
-        self.retriever    = None
-        self.chain        = None
         self.loaded_pdf   = None
         print("[RAG] Cleared all stored data.")
