@@ -1,5 +1,9 @@
 # ── Embedding model (downloaded once, runs fully offline after that) ──────────
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"   # stronger than all-MiniLM-L6-v2
+
+# ── Re-ranker model (cross-encoder, runs after retrieval) ─────────────────────
+RERANKER_MODEL  = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANKER_TOP_K  = 5    # keep top 5 after re-ranking
 
 # ── Text splitting ─────────────────────────────────────────────────────────────
 CHUNK_SIZE    = 1200  # characters per chunk
